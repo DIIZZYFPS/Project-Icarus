@@ -12,6 +12,8 @@ function createWindow() {
     });
 
     mainWindow.loadURL("http://localhost:5173");
+    // Remove the bar
+    mainWindow.setMenuBarVisibility(false);
 
     mainWindow.on("closed", () => {
         mainWindow = null;
