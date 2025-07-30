@@ -141,8 +141,8 @@ export const VoiceConversation = () => {
             <div className="p-4 border-b border-border/50">
               <h2 className="font-semibold">Conversation History</h2>
             </div>
-            
-            <ScrollArea ref={scrollAreaRef} className="h-[500px] p-4">
+
+            <ScrollArea ref={scrollAreaRef} className="h-[75vh] p-4">
               <div className="space-y-4">
                 {messages.length === 0 ? (
                   <div className="text-center text-muted-foreground py-8">
