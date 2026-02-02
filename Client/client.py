@@ -41,7 +41,7 @@ async def send_audio():
                 
                 # Optional: Read response (e.g., "Silence" or "Speech")
                 response = await websocket.recv()
-                # print(f"Server says: {response}") 
+                print(f"Server says: {response}") 
                 
         except KeyboardInterrupt:
             logger.info("Stopping stream...")
