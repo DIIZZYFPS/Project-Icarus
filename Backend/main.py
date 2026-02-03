@@ -48,7 +48,7 @@ VAD_WINDOW_SIZE = 512  # Silero VAD requires exactly 512 samples at 16kHz
 SPEECH_THRESHOLD = 0.5  # Probability threshold for speech detection
 MIN_SILENCE_DURATION_MS = 500  # Silence duration to consider speech ended
 MIN_SPEECH_DURATION_MS = 250  # Minimum speech duration to keep
-SESSION_TIMEOUT_SEC = 5.0  # End session after 5s of no speech
+SESSION_TIMEOUT_SEC = 25.0  # End session after 25s of no speech
 END_SESSION_PHRASES = ["end session", "and session", "that's all", "that is all"]  # Fuzzy match for mishearing
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -209,51 +209,72 @@ async def transcribe_audio(audio_bytes: bytes) -> str:
     return await asyncio.to_thread(transcribe_audio_sync, audio_bytes)
 
 
-async def synthesize_speech(text: str) -> bytes:
+async def synthesize_speech(text: str, websocket) -> bool:
     """
-    Synthesize text to speech using Edge TTS.
-    Returns raw PCM audio bytes (int16, 24kHz).
+    Synthesize text to speech using Edge TTS and stream chunks to client.
+    Sends audio in chunks to prevent WebSocket timeout.
+    Returns True if audio was sent successfully.
     """
     if not tts_enabled:
-        return b""
+        return False
     
     logger.info(f"🔊 Synthesizing speech: {text[:50]}...")
     start_time = time.time()
     
     try:
-        # Edge TTS returns MP3, we need to convert to PCM
+        from pydub import AudioSegment
+        
+        # Edge TTS returns MP3, stream chunks as they arrive
         communicate = edge_tts.Communicate(text, TTS_VOICE)
         
-        # Collect all audio chunks
-        audio_chunks = []
+        # Collect MP3 chunks and send audio periodically
+        mp3_buffer = b""
+        chunks_sent = 0
+        total_pcm_bytes = 0
+        
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
-                audio_chunks.append(chunk["data"])
+                mp3_buffer += chunk["data"]
+                
+                # Every ~50KB of MP3, convert and send PCM
+                # This keeps the connection alive during long synthesis
+                if len(mp3_buffer) >= 50000:
+                    try:
+                        audio = AudioSegment.from_mp3(io.BytesIO(mp3_buffer))
+                        audio = audio.set_frame_rate(TTS_SAMPLE_RATE).set_channels(1).set_sample_width(2)
+                        pcm_chunk = audio.raw_data
+                        await websocket.send_bytes(pcm_chunk)
+                        total_pcm_bytes += len(pcm_chunk)
+                        chunks_sent += 1
+                        mp3_buffer = b""  # Reset buffer
+                    except Exception as e:
+                        logger.warning(f"Chunk conversion error, buffering more: {e}")
+                        # Keep buffering if chunk too small to decode
         
-        mp3_data = b"".join(audio_chunks)
-        
-        # Convert MP3 to PCM using a simple approach
-        # We'll send MP3 directly and let client decode, or use pydub if available
-        try:
-            from pydub import AudioSegment
-            audio = AudioSegment.from_mp3(io.BytesIO(mp3_data))
-            audio = audio.set_frame_rate(TTS_SAMPLE_RATE).set_channels(1).set_sample_width(2)
-            pcm_data = audio.raw_data
-        except ImportError:
-            # Fallback: send MP3 data with a marker so client knows format
-            logger.warning("pydub not installed, sending MP3 format")
-            elapsed = time.time() - start_time
-            logger.info(f"🔊 TTS completed in {elapsed:.2f}s (MP3 format)")
-            return mp3_data
+        # Send remaining audio
+        if mp3_buffer:
+            try:
+                audio = AudioSegment.from_mp3(io.BytesIO(mp3_buffer))
+                audio = audio.set_frame_rate(TTS_SAMPLE_RATE).set_channels(1).set_sample_width(2)
+                pcm_chunk = audio.raw_data
+                await websocket.send_bytes(pcm_chunk)
+                total_pcm_bytes += len(pcm_chunk)
+                chunks_sent += 1
+            except Exception as e:
+                logger.error(f"Final chunk conversion error: {e}")
         
         elapsed = time.time() - start_time
-        duration_sec = len(pcm_data) / 2 / TTS_SAMPLE_RATE
-        logger.info(f"🔊 TTS completed in {elapsed:.2f}s ({duration_sec:.1f}s audio)")
+        duration_sec = total_pcm_bytes / 2 / TTS_SAMPLE_RATE
+        logger.info(f"🔊 TTS completed in {elapsed:.2f}s ({duration_sec:.1f}s audio, {chunks_sent} chunks)")
         
-        return pcm_data
+        return chunks_sent > 0
+        
+    except ImportError:
+        logger.error("pydub not installed, TTS disabled")
+        return False
     except Exception as e:
         logger.error(f"TTS error: {e}")
-        return b""
+        return False
 
 
 def check_end_session(transcript: str) -> bool:
@@ -448,11 +469,10 @@ async def audio_endpoint(websocket: WebSocket):
                                 # Send response to client
                                 await websocket.send_text(f"RESPONSE:{llm_response}")
                                 
-                                # Synthesize and send audio
+                                # Synthesize and stream audio
                                 if tts_enabled:
-                                    audio_data = await synthesize_speech(llm_response)
-                                    if audio_data:
-                                        await websocket.send_bytes(audio_data)
+                                    audio_sent = await synthesize_speech(llm_response, websocket)
+                                    if audio_sent:
                                         await websocket.send_text("AUDIO_END")
                                 
                                 session_state = SessionState.LISTENING
