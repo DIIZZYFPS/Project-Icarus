@@ -35,6 +35,7 @@ RATE = 16000
 CHUNK = 4096  # 256ms of audio per packet
 WAKE_WORD_CHUNK = 1280  # 80ms chunks for OpenWakeWord
 WAKE_WORD_THRESHOLD = 0.5  # Detection threshold
+POST_SESSION_COOLDOWN = 1.5  # Seconds to wait after session ends before listening again
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("IcarusClient")
@@ -226,6 +227,21 @@ async def main():
             
             # Run voice session
             await run_session(stream, p, start_chime, end_chime)
+            
+            # Cooldown period to prevent chime from triggering wake word
+            logger.info(f"Cooldown for {POST_SESSION_COOLDOWN}s...")
+            await asyncio.sleep(POST_SESSION_COOLDOWN)
+            
+            # Flush any audio that accumulated during cooldown
+            try:
+                while stream.get_read_available() > 0:
+                    stream.read(stream.get_read_available(), exception_on_overflow=False)
+            except Exception:
+                pass
+            
+            # Reset wake word model state if it has one
+            if wake_model is not None and hasattr(wake_model, 'reset'):
+                wake_model.reset()
             
             logger.info("Ready for next wake word...\n")
             

@@ -56,6 +56,13 @@ logger.info("Loading Whisper model (small.en)...")
 whisper_model = WhisperModel("small.en", device="cuda", compute_type="float16")
 logger.info("Whisper model loaded successfully.")
 
+# Warmup Whisper with dummy transcription to compile CUDA kernels
+logger.info("Warming up Whisper model (first inference is slow)...")
+_warmup_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second silence
+_warmup_segments, _ = whisper_model.transcribe(_warmup_audio, language="en")
+list(_warmup_segments)  # Force generator execution
+logger.info("Whisper warmup complete.")
+
 
 @app.get("/")
 async def read_root():
@@ -91,6 +98,9 @@ def transcribe_audio_sync(audio_bytes: bytes) -> str:
     Transcribe PCM audio bytes using Whisper (synchronous).
     Called via asyncio.to_thread() to avoid blocking.
     """
+    logger.info("🔄 Starting Whisper transcription...")
+    start_time = time.time()
+    
     # Convert int16 PCM to float32 numpy array
     audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
     audio_float32 = audio_int16.astype(np.float32) / 32768.0
@@ -103,8 +113,14 @@ def transcribe_audio_sync(audio_bytes: bytes) -> str:
         vad_filter=False,
     )
     
+    # Force generator to execute (this is where actual transcription happens)
+    segments_list = list(segments)
+    
+    elapsed = time.time() - start_time
+    logger.info(f"🔄 Whisper completed in {elapsed:.2f}s, {len(segments_list)} segments")
+    
     # Combine all segments
-    transcript = " ".join(segment.text.strip() for segment in segments)
+    transcript = " ".join(segment.text.strip() for segment in segments_list)
     return transcript
 
 
