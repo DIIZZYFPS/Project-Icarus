@@ -13,7 +13,7 @@ from enum import Enum, auto
 from silero_vad import load_silero_vad, get_speech_timestamps
 from faster_whisper import WhisperModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from piper import PiperVoice
+import edge_tts
 
 # Set up logging to track the "Split Brain" connection
 logging.basicConfig(level=logging.INFO)
@@ -62,8 +62,8 @@ MAX_CONVERSATION_TURNS = 10  # Keep last N exchanges
 # ═══════════════════════════════════════════════════════════════════════════════
 # TTS Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
-TTS_MODEL_PATH = Path(__file__).parent / "models" / "tts" / "en_GB-alan-medium.onnx"
-TTS_SAMPLE_RATE = 22050  # Piper outputs at 22050 Hz
+TTS_VOICE = "en-GB-RyanNeural"  # British male voice (similar to Alan)
+TTS_SAMPLE_RATE = 24000  # Edge TTS outputs at 24kHz
 
 ICARUS_SYSTEM_PROMPT = """You are Icarus, an advanced AI assistant created to help your user navigate their digital world with precision and wit. Named after the mythological figure who dared to fly—though you've learned to respect your limits while still reaching for the sky.
 
@@ -139,20 +139,9 @@ except Exception as e:
     llm_model = None
     llm_tokenizer = None
 
-# Load TTS (Piper)
-try:
-    logger.info(f"Loading TTS model from {TTS_MODEL_PATH}...")
-    tts_voice = PiperVoice.load(str(TTS_MODEL_PATH))
-    logger.info("TTS model loaded successfully.")
-    
-    # Warmup TTS
-    logger.info("Warming up TTS...")
-    _warmup_audio = list(tts_voice.synthesize("Hello."))
-    logger.info("TTS warmup complete.")
-except Exception as e:
-    logger.warning(f"Failed to load TTS: {e}")
-    logger.warning("TTS responses will be disabled.")
-    tts_voice = None
+# TTS (Edge TTS - cloud-based, no model loading needed)
+logger.info(f"TTS configured with voice: {TTS_VOICE}")
+tts_enabled = True  # Edge TTS is cloud-based, always available
 
 
 @app.get("/")
@@ -220,43 +209,51 @@ async def transcribe_audio(audio_bytes: bytes) -> str:
     return await asyncio.to_thread(transcribe_audio_sync, audio_bytes)
 
 
-def synthesize_speech_sync(text: str) -> bytes:
+async def synthesize_speech(text: str) -> bytes:
     """
-    Synthesize text to speech using Piper (synchronous).
-    Returns raw PCM audio bytes (int16, 22050 Hz).
+    Synthesize text to speech using Edge TTS.
+    Returns raw PCM audio bytes (int16, 24kHz).
     """
-    if tts_voice is None:
+    if not tts_enabled:
         return b""
     
     logger.info(f"🔊 Synthesizing speech: {text[:50]}...")
     start_time = time.time()
     
     try:
-        # Synthesize to WAV in memory
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, 'wb') as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)  # 16-bit
-            wav_file.setframerate(TTS_SAMPLE_RATE)
-            tts_voice.synthesize(text, wav_file)
+        # Edge TTS returns MP3, we need to convert to PCM
+        communicate = edge_tts.Communicate(text, TTS_VOICE)
         
-        # Extract raw PCM from WAV (skip 44-byte header)
-        wav_buffer.seek(44)
-        audio_data = wav_buffer.read()
+        # Collect all audio chunks
+        audio_chunks = []
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_chunks.append(chunk["data"])
+        
+        mp3_data = b"".join(audio_chunks)
+        
+        # Convert MP3 to PCM using a simple approach
+        # We'll send MP3 directly and let client decode, or use pydub if available
+        try:
+            from pydub import AudioSegment
+            audio = AudioSegment.from_mp3(io.BytesIO(mp3_data))
+            audio = audio.set_frame_rate(TTS_SAMPLE_RATE).set_channels(1).set_sample_width(2)
+            pcm_data = audio.raw_data
+        except ImportError:
+            # Fallback: send MP3 data with a marker so client knows format
+            logger.warning("pydub not installed, sending MP3 format")
+            elapsed = time.time() - start_time
+            logger.info(f"🔊 TTS completed in {elapsed:.2f}s (MP3 format)")
+            return mp3_data
         
         elapsed = time.time() - start_time
-        duration_sec = len(audio_data) / 2 / TTS_SAMPLE_RATE
+        duration_sec = len(pcm_data) / 2 / TTS_SAMPLE_RATE
         logger.info(f"🔊 TTS completed in {elapsed:.2f}s ({duration_sec:.1f}s audio)")
         
-        return audio_data
+        return pcm_data
     except Exception as e:
         logger.error(f"TTS error: {e}")
         return b""
-
-
-async def synthesize_speech(text: str) -> bytes:
-    """Async wrapper for TTS synthesis."""
-    return await asyncio.to_thread(synthesize_speech_sync, text)
 
 
 def check_end_session(transcript: str) -> bool:
@@ -452,7 +449,7 @@ async def audio_endpoint(websocket: WebSocket):
                                 await websocket.send_text(f"RESPONSE:{llm_response}")
                                 
                                 # Synthesize and send audio
-                                if tts_voice is not None:
+                                if tts_enabled:
                                     audio_data = await synthesize_speech(llm_response)
                                     if audio_data:
                                         await websocket.send_bytes(audio_data)

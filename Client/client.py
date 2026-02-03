@@ -32,7 +32,7 @@ class ClientState(Enum):
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-TTS_RATE = 22050  # Piper TTS outputs at 22050 Hz
+TTS_RATE = 24000  # Edge TTS outputs at 24kHz
 CHUNK = 4096  # 256ms of audio per packet
 WAKE_WORD_CHUNK = 1280  # 80ms chunks for OpenWakeWord
 WAKE_WORD_THRESHOLD = 0.5  # Detection threshold
