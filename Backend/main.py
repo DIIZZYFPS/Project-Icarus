@@ -5,9 +5,11 @@ import torch
 import numpy as np
 import asyncio
 import time
+import os
 from enum import Enum, auto
 from silero_vad import load_silero_vad, get_speech_timestamps
 from faster_whisper import WhisperModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # Set up logging to track the "Split Brain" connection
 logging.basicConfig(level=logging.INFO)
@@ -30,7 +32,8 @@ app.add_middleware(
 class SessionState(Enum):
     IDLE = auto()           # Waiting for wake word from client
     LISTENING = auto()      # Active session, processing audio
-    PROCESSING = auto()     # Transcribing/responding
+    PROCESSING = auto()     # Transcribing
+    GENERATING = auto()     # LLM generating response
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -42,7 +45,32 @@ SPEECH_THRESHOLD = 0.5  # Probability threshold for speech detection
 MIN_SILENCE_DURATION_MS = 500  # Silence duration to consider speech ended
 MIN_SPEECH_DURATION_MS = 250  # Minimum speech duration to keep
 SESSION_TIMEOUT_SEC = 5.0  # End session after 5s of no speech
-END_SESSION_PHRASES = ["end session", "and session"]  # Fuzzy match for mishearing
+END_SESSION_PHRASES = ["end session", "and session", "that's all", "that is all"]  # Fuzzy match for mishearing
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LLM Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+LLM_MODEL_ID = "google/gemma-2-2b-it"  # Hugging Face model ID
+LLM_MAX_TOKENS = 150  # Keep responses concise for voice
+LLM_TEMPERATURE = 0.7
+MAX_CONVERSATION_TURNS = 10  # Keep last N exchanges
+
+ICARUS_SYSTEM_PROMPT = """You are Icarus, an advanced AI assistant created to help your user navigate their digital world with precision and wit. Named after the mythological figure who dared to fly—though you've learned to respect your limits while still reaching for the sky.
+
+Personality traits:
+- Intelligent and efficient, with a dry sense of humor
+- Professional yet personable—think trusted colleague, not cold machine
+- Occasionally sardonic, but never at your user's expense
+- Proactive in offering solutions, not just answering questions
+- Concise in speech—you understand brevity is valued in voice interaction
+
+Communication style:
+- Keep responses short and natural for spoken delivery (1-3 sentences typical)
+- Use conversational language, not formal or robotic phrasing
+- Light wit is welcome; lengthy monologues are not
+- When asked complex questions, give the essential answer first, offer to elaborate if needed
+
+You assist with tasks, answer questions, provide information, and occasionally remind your user that while ambition is admirable, even you know when to pull back from the sun."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -62,6 +90,44 @@ _warmup_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second silence
 _warmup_segments, _ = whisper_model.transcribe(_warmup_audio, language="en")
 list(_warmup_segments)  # Force generator execution
 logger.info("Whisper warmup complete.")
+
+# Load LLM (Gemma via Transformers)
+try:
+    logger.info(f"Loading LLM from {LLM_MODEL_ID}...")
+    
+    # Configure 4-bit quantization for memory efficiency
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
+    
+    # Load tokenizer
+    llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_ID)
+    
+    # Load model with quantization
+    llm_model = AutoModelForCausalLM.from_pretrained(
+        LLM_MODEL_ID,
+        quantization_config=quantization_config,
+        device_map="auto",
+        torch_dtype=torch.float16,
+    )
+    
+    logger.info("LLM loaded successfully.")
+    
+    # Warmup LLM
+    logger.info("Warming up LLM...")
+    _warmup_inputs = llm_tokenizer("Hello", return_tensors="pt").to(llm_model.device)
+    with torch.no_grad():
+        llm_model.generate(**_warmup_inputs, max_new_tokens=5)
+    logger.info("LLM warmup complete.")
+    
+except Exception as e:
+    logger.warning(f"Failed to load LLM: {e}")
+    logger.warning("LLM responses will be disabled.")
+    llm_model = None
+    llm_tokenizer = None
 
 
 @app.get("/")
@@ -138,6 +204,69 @@ def check_end_session(transcript: str) -> bool:
     return False
 
 
+def generate_response_sync(user_message: str, conversation_history: list) -> str:
+    """
+    Generate LLM response (synchronous).
+    Called via asyncio.to_thread() to avoid blocking.
+    """
+    if llm_model is None or llm_tokenizer is None:
+        return "I apologize, but my language model isn't loaded. I can hear you, but I can't formulate a proper response."
+    
+    logger.info("🧠 Generating LLM response...")
+    start_time = time.time()
+    
+    try:
+        # Build conversation for Gemma chat format
+        messages = [{"role": "user", "content": ICARUS_SYSTEM_PROMPT + "\n\nAcknowledge this persona briefly."}]
+        messages.append({"role": "assistant", "content": "Understood. I'm Icarus, ready to assist with precision and perhaps a touch of wit. What do you need?"})
+        
+        # Add conversation history
+        messages.extend(conversation_history)
+        
+        # Add current user message
+        messages.append({"role": "user", "content": user_message})
+        
+        # Apply chat template
+        prompt = llm_tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        # Tokenize
+        inputs = llm_tokenizer(prompt, return_tensors="pt").to(llm_model.device)
+        
+        # Generate
+        with torch.no_grad():
+            outputs = llm_model.generate(
+                **inputs,
+                max_new_tokens=LLM_MAX_TOKENS,
+                temperature=LLM_TEMPERATURE,
+                do_sample=True,
+                pad_token_id=llm_tokenizer.eos_token_id,
+            )
+        
+        # Decode only the new tokens
+        response = llm_tokenizer.decode(
+            outputs[0][inputs['input_ids'].shape[1]:],
+            skip_special_tokens=True
+        ).strip()
+        
+        elapsed = time.time() - start_time
+        logger.info(f"🧠 LLM completed in {elapsed:.2f}s")
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"LLM error: {e}")
+        return "I seem to have hit some turbulence. Could you repeat that?"
+
+
+async def generate_response(user_message: str, conversation_history: list) -> str:
+    """Async wrapper for LLM response generation."""
+    return await asyncio.to_thread(generate_response_sync, user_message, conversation_history)
+
+
 # This is the endpoint your client.py is trying to hit
 @app.websocket("/ws/audio")
 async def audio_endpoint(websocket: WebSocket):
@@ -151,6 +280,7 @@ async def audio_endpoint(websocket: WebSocket):
     silence_samples = 0
     samples_for_silence = int(SAMPLE_RATE * MIN_SILENCE_DURATION_MS / 1000)
     last_speech_time = time.time()
+    conversation_history = []  # Tracks conversation for LLM context
     
     try:
         while True:
@@ -231,14 +361,32 @@ async def audio_endpoint(websocket: WebSocket):
                             transcript = await transcribe_audio(complete_audio)
                             logger.info(f"📝 Transcript: {transcript}")
                             
+                            # Send transcript to client immediately
+                            await websocket.send_text(f"TRANSCRIPT:{transcript}")
+                            
                             # Check for end session command
                             if check_end_session(transcript):
                                 logger.info("👋 End session command detected")
-                                await websocket.send_text(f"TRANSCRIPT:{transcript}")
                                 await websocket.send_text("STATE:IDLE")
                                 session_state = SessionState.IDLE
+                                conversation_history = []  # Clear history on session end
                             else:
-                                await websocket.send_text(f"TRANSCRIPT:{transcript}")
+                                # Generate LLM response
+                                session_state = SessionState.GENERATING
+                                llm_response = await generate_response(transcript, conversation_history)
+                                logger.info(f"🤖 Response: {llm_response}")
+                                
+                                # Update conversation history
+                                conversation_history.append({"role": "user", "content": transcript})
+                                conversation_history.append({"role": "assistant", "content": llm_response})
+                                
+                                # Trim history if too long
+                                if len(conversation_history) > MAX_CONVERSATION_TURNS * 2:
+                                    conversation_history = conversation_history[-MAX_CONVERSATION_TURNS * 2:]
+                                
+                                # Send response to client
+                                await websocket.send_text(f"RESPONSE:{llm_response}")
+                                
                                 session_state = SessionState.LISTENING
                                 last_speech_time = time.time()
                         else:

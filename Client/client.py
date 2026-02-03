@@ -177,6 +177,10 @@ async def run_session(stream, p, start_chime, end_chime):
                 if response.startswith("TRANSCRIPT:"):
                     transcript = response.split(":", 1)[1]
                     print(f"📝 You said: {transcript}")
+                
+                elif response.startswith("RESPONSE:"):
+                    llm_response = response.split(":", 1)[1]
+                    print(f"🤖 Icarus: {llm_response}")
                     
                 elif response == "STATE:IDLE":
                     logger.info("Session ended by server")
