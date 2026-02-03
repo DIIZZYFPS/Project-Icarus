@@ -1,0 +1,43 @@
+model_name: hey_icarus
+target_phrase:
+- hey icarus
+n_samples: 5000
+n_samples_val: 500
+tts_batch_size: 32
+piper_sample_generator_path: C:\Users\DIIZZY\Documents\GitHub\Project-Icarus\Backend\piper_sample_generator
+output_dir: C:\Users\DIIZZY\Documents\GitHub\Project-Icarus\Backend\models\hey_icarus
+rir_paths: []
+background_paths: []
+background_paths_duplication_rate: []
+false_positive_validation_data_path: C:\Users\DIIZZY\Documents\GitHub\Project-Icarus\Backend\datasets\validation_set_features.npy
+feature_data_files:
+  ACAV100M: C:\Users\DIIZZY\Documents\GitHub\Project-Icarus\Backend\datasets\openwakeword_features_ACAV100M_2000_hrs_16bit.npy
+augmentation_rounds: 1
+batch_n_per_class:
+  ACAV100M: 512
+  adversarial_negative: 50
+  positive: 50
+max_steps: 50000
+max_negative_weight: 500
+target_false_positives_per_hour: 0.2
+custom_negative_phrases:
+- hey iris
+- hey siri
+- hey google
+- hey alexa
+- hay icarus
+- he icarus
+- hey i curse
+- hey ikarus
+- high icarus
+- hey marcus
+- hey nicholas
+- hey daedalus
+- the icarus
+- by icarus
+augmentation_batch_size: 16
+
+model_type: dnn
+layer_size: 64
+total_length: 32000
+steps: 50000

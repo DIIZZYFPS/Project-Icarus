@@ -1,0 +1,57 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Wake Word Training Requirements
+# ═══════════════════════════════════════════════════════════════════════════════
+# 
+# These dependencies are only needed for training custom wake word models.
+# For inference only (running the voice assistant), use requirements.txt
+#
+# Installation:
+#   pip install -r requirements.txt              # Base dependencies first
+#   pip install -r requirements-training.txt     # Then training dependencies
+#
+# System Dependencies (Windows):
+#   - eSpeak-NG: Required for phonemization
+#     Download: https://github.com/espeak-ng/espeak-ng/releases
+#     Or: winget install eSpeak-NG.eSpeak-NG
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Include base requirements
+-r requirements.txt
+
+# ─── Piper Sample Generator ───────────────────────────────────────────────────
+# For generating synthetic TTS audio samples
+piper-tts
+# piper-phonemize              # Included with piper-tts
+# espeak-phonemizer            # Causes build issues on Windows, use deep-phonemizer instead
+webrtcvad-wheels               # Pre-built wheels for Windows (no compiler needed)
+audiomentations>=0.30.0
+
+# ─── OpenWakeWord Training ────────────────────────────────────────────────────
+# Core training dependencies
+torchinfo
+torchmetrics
+speechbrain>=0.5.14
+torch-audiomentations>=0.11.0
+mutagen>=1.46.0
+pronouncing>=0.2.0
+deep-phonemizer==0.0.19
+
+# ─── Data Processing ──────────────────────────────────────────────────────────
+pyyaml
+datasets
+soundfile
+numpy
+
+# ─── Compatibility Pins ───────────────────────────────────────────────────────
+# Pin scipy to avoid acoustics compatibility issues
+scipy==1.13.1
+acoustics>=0.2.5
+
+# ─── Optional: TFLite Conversion ──────────────────────────────────────────────
+# Uncomment if you need to convert models to TFLite format
+# tensorflow-cpu==2.8.1
+# tensorflow_probability==0.16.0
+# onnx_tf==1.10.0
+# onnx==1.14.0
+# protobuf>=3.20,<4

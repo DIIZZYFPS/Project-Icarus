@@ -91,13 +91,19 @@ def init_wake_word_model():
         return None
     
     try:
-        # Download models if needed
-        openwakeword.utils.download_models()
+        # Use custom trained "hey_icarus" model
+        import os
+        model_path = os.path.join(os.path.dirname(__file__), "models", "hey_icarus.onnx")
         
-        # Use "hey_jarvis" as placeholder until custom "hey_icarus" is trained
-        # Available models: alexa, hey_mycroft, hey_jarvis, etc.
-        model = WakeWordModel(wakeword_models=["hey_jarvis"])
-        logger.info("Wake word model loaded (using 'hey_jarvis' until 'hey_icarus' is trained)")
+        if os.path.exists(model_path):
+            model = WakeWordModel(wakeword_models=[model_path])
+            logger.info("✓ Custom 'Hey Icarus' wake word model loaded!")
+        else:
+            # Fallback to built-in model if custom not found
+            openwakeword.utils.download_models()
+            model = WakeWordModel(wakeword_models=["hey_jarvis"])
+            logger.warning("Custom model not found, using 'hey_jarvis' fallback")
+        
         return model
     except Exception as e:
         logger.warning(f"Failed to load wake word model: {e}")

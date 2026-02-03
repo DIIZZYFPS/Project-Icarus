@@ -1,1 +1,29 @@
 venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Training data and datasets (large files)
+Backend/datasets/
+Backend/models/hey_icarus/hey_icarus/
+Backend/piper_sample_generator/*.pt
+Backend/piper_sample_generator/*.onnx
+
+# Keep the trained model but ignore training intermediates
+!Backend/models/hey_icarus/hey_icarus.onnx
+!Client/models/hey_icarus.onnx
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node modules (frontend)
+node_modules/
+dist/

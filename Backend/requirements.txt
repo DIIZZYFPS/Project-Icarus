@@ -1,12 +1,29 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Project Icarus - Backend Requirements (Inference)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# For training custom wake words, also install: requirements-training.txt
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Server ───────────────────────────────────────────────────────────────────
 uvicorn
 fastapi
 pydantic
 websockets
 python-multipart
+
+# ─── Audio Processing ─────────────────────────────────────────────────────────
 torch
 silero-vad
+
+# ─── Speech-to-Text ───────────────────────────────────────────────────────────
 faster-whisper
+
+# ─── Wake Word Detection ──────────────────────────────────────────────────────
 openwakeword
+
+# ─── LLM ──────────────────────────────────────────────────────────────────────
 transformers
 accelerate
 bitsandbytes
