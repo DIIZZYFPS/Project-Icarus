@@ -1,2 +1,5 @@
 pyaudio
 websockets
+openwakeword
+onnxruntime
+numpy
