@@ -3,3 +3,5 @@ fastapi
 pydantic
 websockets
 python-multipart
+torch
+silero-vad
