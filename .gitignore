@@ -1,7 +1,10 @@
+# Python
 venv/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+.eggs/
 
 # Training data and datasets (large files)
 Backend/datasets/
@@ -9,8 +12,11 @@ Backend/models/hey_icarus/hey_icarus/
 Backend/piper_sample_generator/*.pt
 Backend/piper_sample_generator/*.onnx
 
-# Keep the trained model but ignore training intermediates
-!Backend/models/hey_icarus/hey_icarus.onnx
+# TTS voice models (large files - download separately)
+Backend/models/tts/*.onnx
+Backend/models/tts/*.onnx.json
+
+# Keep the trained wake word model
 !Client/models/hey_icarus.onnx
 
 # IDE
@@ -27,3 +33,13 @@ Thumbs.db
 # Node modules (frontend)
 node_modules/
 dist/
+.vite/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+build/
+*.tflite

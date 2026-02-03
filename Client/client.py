@@ -32,6 +32,7 @@ class ClientState(Enum):
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
+TTS_RATE = 22050  # Piper TTS outputs at 22050 Hz
 CHUNK = 4096  # 256ms of audio per packet
 WAKE_WORD_CHUNK = 1280  # 80ms chunks for OpenWakeWord
 WAKE_WORD_THRESHOLD = 0.5  # Detection threshold
@@ -76,6 +77,19 @@ def play_sound(audio_bytes: bytes, p: pyaudio.PyAudio):
     stream = p.open(format=FORMAT,
                     channels=CHANNELS,
                     rate=RATE,
+                    output=True)
+    stream.write(audio_bytes)
+    stream.stop_stream()
+    stream.close()
+
+
+def play_tts_audio(audio_bytes: bytes, p: pyaudio.PyAudio):
+    """Play TTS audio at 22050 Hz sample rate."""
+    if not audio_bytes:
+        return
+    stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=TTS_RATE,
                     output=True)
     stream.write(audio_bytes)
     stream.stop_stream()
@@ -169,6 +183,8 @@ async def run_session(stream, p, start_chime, end_chime):
             
             logger.info("🎙️ Streaming audio... (say 'end session' or wait 5s silence to stop)")
             
+            audio_buffer = b""  # Buffer for incoming TTS audio
+            
             while True:
                 # Read audio from microphone
                 data = stream.read(CHUNK, exception_on_overflow=False)
@@ -176,10 +192,15 @@ async def run_session(stream, p, start_chime, end_chime):
                 # Send to server
                 await websocket.send(data)
                 
-                # Receive response
+                # Receive response (may be text or binary audio)
                 response = await websocket.recv()
                 
-                # Handle different response types
+                # Handle binary audio data
+                if isinstance(response, bytes):
+                    audio_buffer += response
+                    continue
+                
+                # Handle different text response types
                 if response.startswith("TRANSCRIPT:"):
                     transcript = response.split(":", 1)[1]
                     print(f"📝 You said: {transcript}")
@@ -187,6 +208,15 @@ async def run_session(stream, p, start_chime, end_chime):
                 elif response.startswith("RESPONSE:"):
                     llm_response = response.split(":", 1)[1]
                     print(f"🤖 Icarus: {llm_response}")
+                
+                elif response == "AUDIO_END":
+                    # Play accumulated TTS audio
+                    if audio_buffer:
+                        logger.info("🔊 Playing TTS response...")
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, play_tts_audio, audio_buffer, p
+                        )
+                        audio_buffer = b""
                     
                 elif response == "STATE:IDLE":
                     logger.info("Session ended by server")

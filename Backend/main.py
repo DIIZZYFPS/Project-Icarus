@@ -6,10 +6,14 @@ import numpy as np
 import asyncio
 import time
 import os
+import wave
+import io
+from pathlib import Path
 from enum import Enum, auto
 from silero_vad import load_silero_vad, get_speech_timestamps
 from faster_whisper import WhisperModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from piper import PiperVoice
 
 # Set up logging to track the "Split Brain" connection
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +58,12 @@ LLM_MODEL_ID = "google/gemma-2-2b-it"  # Hugging Face model ID
 LLM_MAX_TOKENS = 150  # Keep responses concise for voice
 LLM_TEMPERATURE = 0.7
 MAX_CONVERSATION_TURNS = 10  # Keep last N exchanges
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TTS Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+TTS_MODEL_PATH = Path(__file__).parent / "models" / "tts" / "en_GB-alan-medium.onnx"
+TTS_SAMPLE_RATE = 22050  # Piper outputs at 22050 Hz
 
 ICARUS_SYSTEM_PROMPT = """You are Icarus, an advanced AI assistant created to help your user navigate their digital world with precision and wit. Named after the mythological figure who dared to fly—though you've learned to respect your limits while still reaching for the sky.
 
@@ -129,6 +139,21 @@ except Exception as e:
     llm_model = None
     llm_tokenizer = None
 
+# Load TTS (Piper)
+try:
+    logger.info(f"Loading TTS model from {TTS_MODEL_PATH}...")
+    tts_voice = PiperVoice.load(str(TTS_MODEL_PATH))
+    logger.info("TTS model loaded successfully.")
+    
+    # Warmup TTS
+    logger.info("Warming up TTS...")
+    _warmup_audio = list(tts_voice.synthesize("Hello."))
+    logger.info("TTS warmup complete.")
+except Exception as e:
+    logger.warning(f"Failed to load TTS: {e}")
+    logger.warning("TTS responses will be disabled.")
+    tts_voice = None
+
 
 @app.get("/")
 async def read_root():
@@ -193,6 +218,45 @@ def transcribe_audio_sync(audio_bytes: bytes) -> str:
 async def transcribe_audio(audio_bytes: bytes) -> str:
     """Async wrapper for Whisper transcription."""
     return await asyncio.to_thread(transcribe_audio_sync, audio_bytes)
+
+
+def synthesize_speech_sync(text: str) -> bytes:
+    """
+    Synthesize text to speech using Piper (synchronous).
+    Returns raw PCM audio bytes (int16, 22050 Hz).
+    """
+    if tts_voice is None:
+        return b""
+    
+    logger.info(f"🔊 Synthesizing speech: {text[:50]}...")
+    start_time = time.time()
+    
+    try:
+        # Synthesize to WAV in memory
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(TTS_SAMPLE_RATE)
+            tts_voice.synthesize(text, wav_file)
+        
+        # Extract raw PCM from WAV (skip 44-byte header)
+        wav_buffer.seek(44)
+        audio_data = wav_buffer.read()
+        
+        elapsed = time.time() - start_time
+        duration_sec = len(audio_data) / 2 / TTS_SAMPLE_RATE
+        logger.info(f"🔊 TTS completed in {elapsed:.2f}s ({duration_sec:.1f}s audio)")
+        
+        return audio_data
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return b""
+
+
+async def synthesize_speech(text: str) -> bytes:
+    """Async wrapper for TTS synthesis."""
+    return await asyncio.to_thread(synthesize_speech_sync, text)
 
 
 def check_end_session(transcript: str) -> bool:
@@ -386,6 +450,13 @@ async def audio_endpoint(websocket: WebSocket):
                                 
                                 # Send response to client
                                 await websocket.send_text(f"RESPONSE:{llm_response}")
+                                
+                                # Synthesize and send audio
+                                if tts_voice is not None:
+                                    audio_data = await synthesize_speech(llm_response)
+                                    if audio_data:
+                                        await websocket.send_bytes(audio_data)
+                                        await websocket.send_text("AUDIO_END")
                                 
                                 session_state = SessionState.LISTENING
                                 last_speech_time = time.time()
