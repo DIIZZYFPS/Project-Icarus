@@ -7,6 +7,7 @@ import { ChatMessage } from "./ChatMessage";
 import { TranscriptionDisplay } from "./TranscriptionDisplay";
 import { Mic, MicOff, Volume2, VolumeX, Bot } from "lucide-react";
 import { toast } from "sonner";
+import type { VoiceState } from "@/types/electron";
 
 interface Message {
   id: string;
@@ -21,6 +22,7 @@ export const VoiceConversation = () => {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [currentTranscription, setCurrentTranscription] = useState("");
   const [isConnected, setIsConnected] = useState(false);
+  const [voiceState, setVoiceState] = useState<VoiceState>("DISCONNECTED");
   const [volume, setVolume] = useState(0.8);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
 
@@ -44,57 +46,139 @@ export const VoiceConversation = () => {
     setMessages(prev => [...prev, newMessage]);
   }, []);
 
-  // Simulate voice interaction for demo purposes
-  const simulateVoiceInteraction = useCallback(() => {
-    // Simulate transcription
-    setTimeout(() => {
-      setCurrentTranscription("Hello, how are you today?");
-    }, 1000);
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // Electron IPC Event Listeners
+  // ═══════════════════════════════════════════════════════════════════════════════
+  useEffect(() => {
+    // Check if running in Electron
+    if (!window.electronAPI) {
+      console.warn("Not running in Electron - IPC not available");
+      return;
+    }
 
-    // Simulate message completion
-    setTimeout(() => {
-      addMessage("Hello, how are you today?", true);
-      setCurrentTranscription("");
-      setIsSpeaking(true);
-    }, 3000);
+    // Python client is ready
+    window.electronAPI.onReady(() => {
+      setIsConnected(true);
+      toast.success("Voice client connected", {
+        description: "Say 'Hey Icarus' to activate",
+      });
+    });
 
-    // Simulate AI response
-    setTimeout(() => {
-      addMessage("Hello! I'm doing well, thank you for asking. How can I assist you today?", false);
-      setIsSpeaking(false);
-    }, 5000);
+    // Voice state changes from Python client
+    window.electronAPI.onStateChange((state: VoiceState) => {
+      setVoiceState(state);
+      
+      switch (state) {
+        case "IDLE":
+          setIsListening(false);
+          setIsSpeaking(false);
+          setCurrentTranscription("");
+          break;
+        case "CONNECTING":
+          setIsListening(false);
+          setIsSpeaking(false);
+          break;
+        case "LISTENING":
+          setIsListening(true);
+          setIsSpeaking(false);
+          break;
+        case "SPEAKING":
+          setIsListening(false);
+          setIsSpeaking(true);
+          break;
+        case "DISCONNECTED":
+          setIsConnected(false);
+          setIsListening(false);
+          setIsSpeaking(false);
+          toast.error("Voice client disconnected");
+          break;
+      }
+    });
+
+    // Real-time transcription from Python client
+    window.electronAPI.onTranscript((text: string) => {
+      setCurrentTranscription(text);
+      // Add user message when transcription is complete
+      if (text.trim()) {
+        addMessage(text, true);
+        setCurrentTranscription("");
+      }
+    });
+
+    // AI response from Python client
+    window.electronAPI.onResponse((text: string) => {
+      addMessage(text, false);
+    });
+
+    // Wake word detected
+    window.electronAPI.onWakeWord((data) => {
+      toast.info("Wake word detected", {
+        description: `${data.model} (confidence: ${Math.round(data.score * 100)}%)`,
+      });
+    });
+
+    // Error from Python client
+    window.electronAPI.onError((error: string) => {
+      console.error("Voice client error:", error);
+      toast.error("Voice client error", {
+        description: error.substring(0, 100),
+      });
+    });
+
+    // Debug logs
+    window.electronAPI.onLog((message: string) => {
+      console.log("[Python]", message);
+    });
+
+    // Cleanup listeners on unmount
+    return () => {
+      window.electronAPI?.removeAllListeners();
+    };
   }, [addMessage]);
 
   const startListening = useCallback(async () => {
-    try {
-      // Request microphone permission
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      setIsListening(true);
-      setIsConnected(true);
-      
-      // Here we would integrate with ElevenLabs conversation
-      // For now, simulate voice interaction
-      simulateVoiceInteraction();
-      
-      toast.success("Voice activated", {
-        description: "Start speaking to the AI assistant",
+    if (!window.electronAPI) {
+      toast.error("Not running in Electron", {
+        description: "Voice features require the desktop app",
       });
-    } catch (error) {
-      toast.error("Microphone access denied", {
-        description: "Please allow microphone access to use voice features",
-      });
+      return;
     }
-  }, [simulateVoiceInteraction]);
+    
+    window.electronAPI.startListening();
+    toast.info("Wake word detection active", {
+      description: "Say 'Hey Icarus' to start speaking",
+    });
+  }, []);
 
   const stopListening = useCallback(() => {
+    if (window.electronAPI) {
+      window.electronAPI.stopListening();
+    }
     setIsListening(false);
-    setIsConnected(false);
     setCurrentTranscription("");
   }, []);
 
   const toggleMute = useCallback(() => {
     setVolume(prev => prev > 0 ? 0 : 0.8);
   }, []);
+
+  // Status text based on current state
+  const getStatusText = () => {
+    switch (voiceState) {
+      case "IDLE":
+        return "Say 'Hey Icarus' to activate";
+      case "CONNECTING":
+        return "Connecting to server...";
+      case "LISTENING":
+        return "Listening...";
+      case "SPEAKING":
+        return "AI is responding...";
+      case "DISCONNECTED":
+        return "Voice client not connected";
+      default:
+        return "Click to start conversation";
+    }
+  };
 
   return (
     <div className="min-h-screen bg-gradient-bg flex flex-col">
@@ -106,7 +190,7 @@ export const VoiceConversation = () => {
               Voice Assistant
             </h1>
             <p className="text-muted-foreground">
-              {isConnected ? "Connected and ready" : "Click the microphone to start"}
+              {isConnected ? getStatusText() : "Voice client not connected"}
             </p>
           </div>
           
@@ -195,10 +279,10 @@ export const VoiceConversation = () => {
                 
                 <div>
                   <p className="font-medium">
-                    {isListening ? "Listening" : "Press to Talk"}
+                    {isListening ? "Listening" : isSpeaking ? "Speaking" : "Idle"}
                   </p>
                   <p className="text-sm text-muted-foreground">
-                    {isConnected ? "Voice connection active" : "Click to start conversation"}
+                    {getStatusText()}
                   </p>
                 </div>
               </div>
