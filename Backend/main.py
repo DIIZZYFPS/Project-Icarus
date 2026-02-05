@@ -13,7 +13,7 @@ from enum import Enum, auto
 from silero_vad import load_silero_vad, get_speech_timestamps
 # from faster_whisper import WhisperModel
 from funasr import AutoModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import Gemma3ForConditionalGeneration, AutoProcessor
 from kokoro import KPipeline
 import re
 
@@ -55,13 +55,13 @@ VAD_WINDOW_SIZE = 512  # Silero VAD requires exactly 512 samples at 16kHz
 SPEECH_THRESHOLD = 0.5  # Probability threshold for speech detection
 MIN_SILENCE_DURATION_MS = 500  # Silence duration to consider speech ended
 MIN_SPEECH_DURATION_MS = 250  # Minimum speech duration to keep
-SESSION_TIMEOUT_SEC = 25.0  # End session after 25s of no speech
+SESSION_TIMEOUT_SEC = 100 # End session after 100s of no speech
 END_SESSION_PHRASES = ["end session", "and session", "that's all", "that is all"]  # Fuzzy match for mishearing
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LLM Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
-LLM_MODEL_ID = "google/gemma-2-2b-it"  # Hugging Face model ID
+LLM_MODEL_ID = "pytorch/gemma-3-12b-it-INT4"  # TorchAO INT4 pre-quantized (1.7x faster)
 LLM_MAX_TOKENS = 150  # Keep responses concise for voice
 LLM_TEMPERATURE = 0.7
 MAX_CONVERSATION_TURNS = 10  # Keep last N exchanges
@@ -135,34 +135,35 @@ try:
 except Exception as e:
     logger.warning(f"Failed to warmup SenseVoice model: {e}")
 
-# Load LLM (Gemma via Transformers)
+# Load LLM (Gemma 3 via Transformers - TorchAO INT4 pre-quantized)
 try:
     logger.info(f"Loading LLM from {LLM_MODEL_ID}...")
     
-    # Configure 4-bit quantization for memory efficiency
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    )
+    # Use AutoProcessor for Gemma 3 (handles multimodal architecture)
+    # Load from base model for processor compatibility
+    llm_processor = AutoProcessor.from_pretrained("google/gemma-3-12b-it")
     
-    # Load tokenizer
-    llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_ID)
-    
-    # Load model with quantization
-    llm_model = AutoModelForCausalLM.from_pretrained(
+    # Load TorchAO INT4 pre-quantized model (1.7x faster than bitsandbytes)
+    llm_model = Gemma3ForConditionalGeneration.from_pretrained(
         LLM_MODEL_ID,
-        quantization_config=quantization_config,
         device_map="auto",
-        torch_dtype=torch.float16,
+        torch_dtype="auto",
+        attn_implementation="eager",
+        low_cpu_mem_usage=True,
     )
     
     logger.info("LLM loaded successfully.")
     
-    # Warmup LLM
+    # Warmup LLM with Gemma 3 message format
     logger.info("Warming up LLM...")
-    _warmup_inputs = llm_tokenizer("Hello", return_tensors="pt").to(llm_model.device)
+    _warmup_messages = [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}]
+    _warmup_inputs = llm_processor.apply_chat_template(
+        _warmup_messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt"
+    ).to(llm_model.device)
     with torch.no_grad():
         llm_model.generate(**_warmup_inputs, max_new_tokens=5)
     logger.info("LLM warmup complete.")
@@ -171,7 +172,7 @@ except Exception as e:
     logger.warning(f"Failed to load LLM: {e}")
     logger.warning("LLM responses will be disabled.")
     llm_model = None
-    llm_tokenizer = None
+    llm_processor = None
 
 # TTS (Kokoro - local TTS)
 try:
@@ -386,19 +387,26 @@ def generate_response_sync(user_message: str, conversation_history: list, emotio
         conversation_history: Previous conversation turns
         emotion: Optional detected emotion from SenseVoice
     """
-    if llm_model is None or llm_tokenizer is None:
+    if llm_model is None or llm_processor is None:
         return "I apologize, but my language model isn't loaded. I can hear you, but I can't formulate a proper response."
     
     logger.info("🧠 Generating LLM response...")
     start_time = time.time()
     
     try:
-        # Build conversation for Gemma chat format
-        messages = [{"role": "user", "content": ICARUS_SYSTEM_PROMPT + "\n\nAcknowledge this persona briefly."}]
-        messages.append({"role": "assistant", "content": "Understood. I'm Icarus, ready to assist with precision and perhaps a touch of wit. What do you need?"})
+        # Build conversation for Gemma 3 chat format (multimodal structure)
+        # System prompt as first user message with assistant acknowledgment
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": ICARUS_SYSTEM_PROMPT + "\n\nAcknowledge this persona briefly."}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Understood. I'm Icarus, ready to assist with precision and perhaps a touch of wit. What do you need?"}]}
+        ]
         
-        # Add conversation history
-        messages.extend(conversation_history)
+        # Add conversation history (convert to Gemma 3 format)
+        for msg in conversation_history:
+            messages.append({
+                "role": msg["role"],
+                "content": [{"type": "text", "text": msg["content"]}]
+            })
         
         # Build user message with emotion context if available
         emotion_context = ""
@@ -407,18 +415,19 @@ def generate_response_sync(user_message: str, conversation_history: list, emotio
         
         full_user_message = emotion_context + user_message
         
-        # Add current user message
-        messages.append({"role": "user", "content": full_user_message})
+        # Add current user message in Gemma 3 format
+        messages.append({"role": "user", "content": [{"type": "text", "text": full_user_message}]})
         
-        # Apply chat template
-        prompt = llm_tokenizer.apply_chat_template(
+        # Apply chat template using processor
+        inputs = llm_processor.apply_chat_template(
             messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt"
+        ).to(llm_model.device)
         
-        # Tokenize
-        inputs = llm_tokenizer(prompt, return_tensors="pt").to(llm_model.device)
+        input_len = inputs["input_ids"].shape[1]
         
         # Generate
         with torch.no_grad():
@@ -427,12 +436,11 @@ def generate_response_sync(user_message: str, conversation_history: list, emotio
                 max_new_tokens=LLM_MAX_TOKENS,
                 temperature=LLM_TEMPERATURE,
                 do_sample=True,
-                pad_token_id=llm_tokenizer.eos_token_id,
             )
         
         # Decode only the new tokens
-        response = llm_tokenizer.decode(
-            outputs[0][inputs['input_ids'].shape[1]:],
+        response = llm_processor.decode(
+            outputs[0][input_len:],
             skip_special_tokens=True
         ).strip()
         
