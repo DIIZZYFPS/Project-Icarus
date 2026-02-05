@@ -5,7 +5,15 @@ import websockets
 import logging
 import numpy as np
 import math
+import sys
+import json
+import io
 from enum import Enum, auto
+
+# Fix Windows console encoding for emoji/unicode characters
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # Conditional import for wake word (may not be installed yet)
 try:
@@ -15,6 +23,33 @@ try:
 except ImportError:
     WAKE_WORD_AVAILABLE = False
     print("⚠️ OpenWakeWord not installed. Run: pip install openwakeword onnxruntime")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# IPC Communication (for Electron parent process)
+# ═══════════════════════════════════════════════════════════════════════════════
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types."""
+    def default(self, obj):
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
+def ipc_emit(msg_type: str, payload: any = None):
+    """
+    Emit a structured message for the Electron parent process to consume.
+    Format: IPC_JSON:{"type": "...", "payload": ...}
+    """
+    message = {"type": msg_type}
+    if payload is not None:
+        message["payload"] = payload
+    print(f"IPC_JSON:{json.dumps(message, cls=NumpyEncoder)}")
+    sys.stdout.flush()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -37,6 +72,12 @@ CHUNK = 4096  # 256ms of audio per packet
 WAKE_WORD_CHUNK = 1280  # 80ms chunks for OpenWakeWord
 WAKE_WORD_THRESHOLD = 0.5  # Detection threshold
 POST_SESSION_COOLDOWN = 1.5  # Seconds to wait after session ends before listening again
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Wake Word Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# Set to True to use custom "hey_icarus" model, False to use built-in "hey_jarvis"
+USE_CUSTOM_WAKE_WORD = False  # TODO: Set to True once custom model is ready
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("IcarusClient")
@@ -105,18 +146,24 @@ def init_wake_word_model():
         return None
     
     try:
-        # Use custom trained "hey_icarus" model
         import os
-        model_path = os.path.join(os.path.dirname(__file__), "models", "hey_icarus.onnx")
         
-        if os.path.exists(model_path):
-            model = WakeWordModel(wakeword_models=[model_path])
-            logger.info("✓ Custom 'Hey Icarus' wake word model loaded!")
-        else:
-            # Fallback to built-in model if custom not found
-            openwakeword.utils.download_models()
-            model = WakeWordModel(wakeword_models=["hey_jarvis"])
-            logger.warning("Custom model not found, using 'hey_jarvis' fallback")
+        if USE_CUSTOM_WAKE_WORD:
+            # Use custom trained "hey_icarus" model
+            model_path = os.path.join(os.path.dirname(__file__), "models", "hey_icarus.onnx")
+            if os.path.exists(model_path):
+                model = WakeWordModel(wakeword_models=[model_path])
+                logger.info("✓ Custom 'Hey Icarus' wake word model loaded!")
+                ipc_emit("LOG", "Custom 'Hey Icarus' wake word model loaded")
+                return model
+            else:
+                logger.warning("Custom model file not found, falling back to hey_jarvis")
+        
+        # Use built-in "hey_jarvis" model
+        openwakeword.utils.download_models()
+        model = WakeWordModel(wakeword_models=["hey_jarvis"])
+        logger.info("Using built-in 'hey_jarvis' wake word model")
+        ipc_emit("LOG", "Using 'hey_jarvis' wake word model")
         
         return model
     except Exception as e:
@@ -136,6 +183,7 @@ async def listen_for_wake_word(wake_model, stream, p) -> bool:
         return True
     
     logger.info("🎧 Listening for wake word ('Hey Jarvis')...")
+    ipc_emit("STATE", "IDLE")
     
     while True:
         # Read smaller chunks for wake word detection
@@ -151,6 +199,7 @@ async def listen_for_wake_word(wake_model, stream, p) -> bool:
         for model_name, score in prediction.items():
             if score > WAKE_WORD_THRESHOLD:
                 logger.info(f"🎯 Wake word detected: {model_name} (score: {score:.2f})")
+                ipc_emit("WAKE_WORD", {"model": model_name, "score": round(score, 2)})
                 return True
         
         # Small yield to prevent blocking
@@ -168,6 +217,7 @@ async def run_session(stream, p, start_chime, end_chime):
     
     uri = "ws://localhost:8000/ws/audio"
     logger.info(f"Connecting to Icarus Brain at {uri}...")
+    ipc_emit("STATE", "CONNECTING")
     
     try:
         async with websockets.connect(uri) as websocket:
@@ -182,6 +232,7 @@ async def run_session(stream, p, start_chime, end_chime):
                 logger.warning(f"Unexpected response: {response}")
             
             logger.info("🎙️ Streaming audio... (say 'end session' or wait 5s silence to stop)")
+            ipc_emit("STATE", "LISTENING")
             
             audio_buffer = b""  # Buffer for incoming TTS audio
             
@@ -204,10 +255,13 @@ async def run_session(stream, p, start_chime, end_chime):
                 if response.startswith("TRANSCRIPT:"):
                     transcript = response.split(":", 1)[1]
                     print(f"📝 You said: {transcript}")
+                    ipc_emit("TRANSCRIPT", transcript)
                 
                 elif response.startswith("RESPONSE:"):
                     llm_response = response.split(":", 1)[1]
                     print(f"🤖 Icarus: {llm_response}")
+                    ipc_emit("RESPONSE", llm_response)
+                    ipc_emit("STATE", "SPEAKING")
                 
                 elif response == "AUDIO_END":
                     # Play accumulated TTS audio
@@ -217,9 +271,11 @@ async def run_session(stream, p, start_chime, end_chime):
                             None, play_tts_audio, audio_buffer, p
                         )
                         audio_buffer = b""
+                        ipc_emit("STATE", "LISTENING")
                     
                 elif response == "STATE:IDLE":
                     logger.info("Session ended by server")
+                    ipc_emit("STATE", "IDLE")
                     break
                     
                 elif response != "ACK":
@@ -230,9 +286,11 @@ async def run_session(stream, p, start_chime, end_chime):
             
     except websockets.exceptions.ConnectionClosed:
         logger.info("Connection closed")
+        ipc_emit("STATE", "IDLE")
         play_sound(end_chime, p)
     except Exception as e:
         logger.error(f"Session error: {e}")
+        ipc_emit("ERROR", str(e))
         play_sound(end_chime, p)
 
 
@@ -259,6 +317,7 @@ async def main():
     wake_model = init_wake_word_model()
     
     logger.info("Icarus Client started.")
+    ipc_emit("READY", True)
     
     try:
         while True:
@@ -284,6 +343,7 @@ async def main():
                 wake_model.reset()
             
             logger.info("Ready for next wake word...\n")
+            ipc_emit("STATE", "IDLE")
             
     except KeyboardInterrupt:
         logger.info("Shutting down...")
