@@ -5,7 +5,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { VoiceIndicator } from "./VoiceIndicator";
 import { ChatMessage } from "./ChatMessage";
 import { TranscriptionDisplay } from "./TranscriptionDisplay";
-import { Mic, MicOff, Volume2, VolumeX, Bot } from "lucide-react";
+import { Mic, MicOff, Volume2, VolumeX, Bot, Moon, Sun } from "lucide-react";
 import { toast } from "sonner";
 import type { VoiceState } from "@/types/electron";
 
@@ -25,6 +25,27 @@ export const VoiceConversation = () => {
   const [voiceState, setVoiceState] = useState<VoiceState>("DISCONNECTED");
   const [volume, setVolume] = useState(0.8);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    // Check localStorage first, then system preference
+    const stored = localStorage.getItem('theme');
+    if (stored === 'dark' || stored === 'light') {
+      return stored;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+      return 'dark';
+    }
+    return 'light';
+  });
+
+  // Apply theme to document on mount and when theme changes
+  useEffect(() => {
+    if (theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+    localStorage.setItem('theme', theme);
+  }, [theme]);
 
   // Scroll to bottom when new messages arrive
   useEffect(() => {
@@ -157,6 +178,9 @@ export const VoiceConversation = () => {
     setIsListening(false);
     setCurrentTranscription("");
   }, []);
+  const toggleTheme = useCallback(() => {
+    setTheme(prev => prev === 'light' ? 'dark' : 'light');
+  }, []); 
 
   const toggleMute = useCallback(() => {
     setVolume(prev => prev > 0 ? 0 : 0.8);
@@ -212,6 +236,13 @@ export const VoiceConversation = () => {
                 <VolumeX className="w-4 h-4" />
               )}
             </Button>
+            <Button
+              variant="ghost"
+              size='icon'
+              onClick={toggleTheme}
+              >
+                {theme === 'light' ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
+              </Button>
           </div>
         </div>
       </div>
