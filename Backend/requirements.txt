@@ -18,7 +18,8 @@ torch
 silero-vad
 
 # ─── Speech-to-Text ───────────────────────────────────────────────────────────
-faster-whisper
+funasr
+modelscope
 
 # ─── Wake Word Detection ──────────────────────────────────────────────────────
 openwakeword
@@ -27,3 +28,7 @@ openwakeword
 transformers
 accelerate
 bitsandbytes
+
+# ─── Text-to-Speech ───────────────────────────────────────────────────────────
+kokoro>=0.9.4
+soundfile

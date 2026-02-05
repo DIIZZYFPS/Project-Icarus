@@ -11,13 +11,20 @@ import io
 from pathlib import Path
 from enum import Enum, auto
 from silero_vad import load_silero_vad, get_speech_timestamps
-from faster_whisper import WhisperModel
+# from faster_whisper import WhisperModel
+from funasr import AutoModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-import edge_tts
+from kokoro import KPipeline
+import re
 
 # Set up logging to track the "Split Brain" connection
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger("IcarusBrain")
+logger.setLevel(logging.INFO)
 
 app = FastAPI()
 
@@ -62,8 +69,22 @@ MAX_CONVERSATION_TURNS = 10  # Keep last N exchanges
 # ═══════════════════════════════════════════════════════════════════════════════
 # TTS Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
-TTS_VOICE = "en-GB-RyanNeural"  # British male voice (similar to Alan)
-TTS_SAMPLE_RATE = 24000  # Edge TTS outputs at 24kHz
+TTS_VOICE = "bm_george"  # British male voice
+TTS_SAMPLE_RATE = 24000  # Kokoro outputs at 24kHz
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Emotion Mapping (SenseVoice emotions to natural descriptions for LLM)
+# ═══════════════════════════════════════════════════════════════════════════════
+EMOTION_MAP = {
+    "HAPPY": "happy and upbeat",
+    "SAD": "sad or melancholic",
+    "ANGRY": "frustrated or angry",
+    "SURPRISED": "surprised or caught off guard",
+    "FEARFUL": "anxious or worried",
+    "DISGUSTED": "displeased",
+    "NEUTRAL": None,  # No special context needed
+    "UNKNOWN": None,  # Can't determine emotion
+}
 
 ICARUS_SYSTEM_PROMPT = """You are Icarus, an advanced AI assistant created to help your user navigate their digital world with precision and wit. Named after the mythological figure who dared to fly—though you've learned to respect your limits while still reaching for the sky.
 
@@ -90,16 +111,29 @@ logger.info("Loading Silero VAD model...")
 vad_model = load_silero_vad()
 logger.info("Silero VAD model loaded successfully.")
 
-logger.info("Loading Whisper model (small.en)...")
-whisper_model = WhisperModel("small.en", device="cuda", compute_type="float16")
-logger.info("Whisper model loaded successfully.")
+logger.info("Loading SenseVoice model ...")
+sense_voice_model = AutoModel(
+    model = "iic/SenseVoiceSmall",
+    device = "cuda",
+    disable_update = True,
+    disable_pbar = True,
+)
+logger.info("SenseVoice model loaded successfully.")
 
-# Warmup Whisper with dummy transcription to compile CUDA kernels
-logger.info("Warming up Whisper model (first inference is slow)...")
-_warmup_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second silence
-_warmup_segments, _ = whisper_model.transcribe(_warmup_audio, language="en")
-list(_warmup_segments)  # Force generator execution
-logger.info("Whisper warmup complete.")
+# Warmup SenseVoice with dummy transcription to compile CUDA kernels
+logger.info("Warming up SenseVoice model (first inference is slow)...")
+
+try:
+    _warmup_audio = np.zeros(SAMPLE_RATE, dtype=np.float32)  # 1 second silence
+    sense_voice_model.generate(
+        input = _warmup_audio,
+        cache = {},
+        language = "auto",
+        use_itn = True,
+    )
+    logger.info("SenseVoice warmup complete.")
+except Exception as e:
+    logger.warning(f"Failed to warmup SenseVoice model: {e}")
 
 # Load LLM (Gemma via Transformers)
 try:
@@ -139,9 +173,23 @@ except Exception as e:
     llm_model = None
     llm_tokenizer = None
 
-# TTS (Edge TTS - cloud-based, no model loading needed)
-logger.info(f"TTS configured with voice: {TTS_VOICE}")
-tts_enabled = True  # Edge TTS is cloud-based, always available
+# TTS (Kokoro - local TTS)
+try:
+    logger.info(f"Loading Kokoro TTS with voice: {TTS_VOICE}...")
+    kokoro_pipeline = KPipeline(lang_code='b')  # 'b' = British English
+    logger.info("Kokoro TTS loaded successfully.")
+    
+    # Warmup TTS
+    logger.info("Warming up Kokoro TTS...")
+    for _, _, _audio in kokoro_pipeline("Hello.", voice=TTS_VOICE):
+        pass  # Just run through to warm up
+    logger.info("Kokoro TTS warmup complete.")
+    tts_enabled = True
+except Exception as e:
+    logger.warning(f"Failed to load Kokoro TTS: {e}")
+    logger.warning("TTS responses will be disabled.")
+    kokoro_pipeline = None
+    tts_enabled = False
 
 
 @app.get("/")
@@ -173,12 +221,42 @@ def process_vad_on_chunk(audio_tensor: torch.Tensor) -> float:
     return max_prob
 
 
-def transcribe_audio_sync(audio_bytes: bytes) -> str:
+def parse_sensevoice_output(raw_text: str) -> tuple[str, str | None]:
     """
-    Transcribe PCM audio bytes using Whisper (synchronous).
+    Parse SenseVoice output to extract clean text and emotion.
+    
+    SenseVoice format: <|en|><|EMOTION|><|Event|><|withitn|>Actual text here.
+    
+    Returns: (clean_text, emotion) where emotion is the detected emotion or None
+    """
+    # Pattern to match all tags like <|something|>
+    tag_pattern = r'<\|([^|]+)\|>'
+    
+    # Find all tags
+    tags = re.findall(tag_pattern, raw_text)
+    
+    # Remove all tags to get clean text
+    clean_text = re.sub(tag_pattern, '', raw_text).strip()
+    
+    # Look for emotion in tags (check against our emotion map)
+    emotion = None
+    for tag in tags:
+        tag_upper = tag.upper()
+        if tag_upper in EMOTION_MAP:
+            emotion = tag_upper
+            break
+    
+    return clean_text, emotion
+
+
+def transcribe_audio_sync(audio_bytes: bytes) -> tuple[str, str | None]:
+    """
+    Transcribe PCM audio bytes using SenseVoice (synchronous).
     Called via asyncio.to_thread() to avoid blocking.
+    
+    Returns: (clean_text, emotion) tuple
     """
-    logger.info("🔄 Starting Whisper transcription...")
+    logger.info("🔄 Starting SenseVoice transcription...")
     start_time = time.time()
     
     # Convert int16 PCM to float32 numpy array
@@ -186,94 +264,106 @@ def transcribe_audio_sync(audio_bytes: bytes) -> str:
     audio_float32 = audio_int16.astype(np.float32) / 32768.0
     
     # Transcribe (VAD already filtered, so disable internal VAD)
-    segments, info = whisper_model.transcribe(
-        audio_float32,
-        beam_size=5,
-        language="en",
-        vad_filter=False,
+    res = sense_voice_model.generate(
+        input = audio_float32,
+        cache = {},
+        language = "en",
+        use_itn = True,
+        batch_size_s=60,
+        merge_vad=True,
+        merge_length_s=15
     )
     
-    # Force generator to execute (this is where actual transcription happens)
-    segments_list = list(segments)
-    
     elapsed = time.time() - start_time
-    logger.info(f"🔄 Whisper completed in {elapsed:.2f}s, {len(segments_list)} segments")
+
+    raw_text = ""
+    if isinstance(res, list) and len(res) > 0:
+        raw_text = res[0].get("text", "")
+
+    logger.info(f"🔄 SenseVoice raw output in {elapsed:.2f}s: '{raw_text}'")
     
-    # Combine all segments
-    transcript = " ".join(segment.text.strip() for segment in segments_list)
-    return transcript
+    # Parse to extract clean text and emotion
+    clean_text, emotion = parse_sensevoice_output(raw_text)
+    
+    if emotion:
+        logger.info(f"🎭 Detected emotion: {emotion}")
+    
+    return clean_text, emotion
 
 
-async def transcribe_audio(audio_bytes: bytes) -> str:
-    """Async wrapper for Whisper transcription."""
+async def transcribe_audio(audio_bytes: bytes) -> tuple[str, str | None]:
+    """Async wrapper for SenseVoice transcription. Returns (clean_text, emotion)."""
     return await asyncio.to_thread(transcribe_audio_sync, audio_bytes)
 
 
-async def synthesize_speech(text: str, websocket) -> bool:
+def synthesize_speech_sync(text: str) -> bytes:
     """
-    Synthesize text to speech using Edge TTS and stream chunks to client.
-    Sends audio in chunks to prevent WebSocket timeout.
-    Returns True if audio was sent successfully.
+    Synthesize text to speech using Kokoro (synchronous).
+    Returns raw PCM audio bytes (int16, 24kHz).
     """
-    if not tts_enabled:
-        return False
+    if not tts_enabled or kokoro_pipeline is None:
+        return b""
     
     logger.info(f"🔊 Synthesizing speech: {text[:50]}...")
     start_time = time.time()
     
     try:
-        from pydub import AudioSegment
+        # Collect all audio chunks from Kokoro
+        audio_chunks = []
+        for _, _, audio in kokoro_pipeline(text, voice=TTS_VOICE, speed=1.0):
+            audio_chunks.append(audio)
         
-        # Edge TTS returns MP3, stream chunks as they arrive
-        communicate = edge_tts.Communicate(text, TTS_VOICE)
+        if not audio_chunks:
+            logger.warning("Kokoro returned no audio")
+            return b""
         
-        # Collect MP3 chunks and send audio periodically
-        mp3_buffer = b""
-        chunks_sent = 0
-        total_pcm_bytes = 0
+        # Concatenate all chunks
+        full_audio = np.concatenate(audio_chunks)
         
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                mp3_buffer += chunk["data"]
-                
-                # Every ~50KB of MP3, convert and send PCM
-                # This keeps the connection alive during long synthesis
-                if len(mp3_buffer) >= 50000:
-                    try:
-                        audio = AudioSegment.from_mp3(io.BytesIO(mp3_buffer))
-                        audio = audio.set_frame_rate(TTS_SAMPLE_RATE).set_channels(1).set_sample_width(2)
-                        pcm_chunk = audio.raw_data
-                        await websocket.send_bytes(pcm_chunk)
-                        total_pcm_bytes += len(pcm_chunk)
-                        chunks_sent += 1
-                        mp3_buffer = b""  # Reset buffer
-                    except Exception as e:
-                        logger.warning(f"Chunk conversion error, buffering more: {e}")
-                        # Keep buffering if chunk too small to decode
-        
-        # Send remaining audio
-        if mp3_buffer:
-            try:
-                audio = AudioSegment.from_mp3(io.BytesIO(mp3_buffer))
-                audio = audio.set_frame_rate(TTS_SAMPLE_RATE).set_channels(1).set_sample_width(2)
-                pcm_chunk = audio.raw_data
-                await websocket.send_bytes(pcm_chunk)
-                total_pcm_bytes += len(pcm_chunk)
-                chunks_sent += 1
-            except Exception as e:
-                logger.error(f"Final chunk conversion error: {e}")
+        # Convert float32 [-1, 1] to int16 PCM
+        audio_int16 = (full_audio * 32767).astype(np.int16)
+        pcm_data = audio_int16.tobytes()
         
         elapsed = time.time() - start_time
-        duration_sec = total_pcm_bytes / 2 / TTS_SAMPLE_RATE
-        logger.info(f"🔊 TTS completed in {elapsed:.2f}s ({duration_sec:.1f}s audio, {chunks_sent} chunks)")
+        duration_sec = len(pcm_data) / 2 / TTS_SAMPLE_RATE
+        logger.info(f"🔊 TTS completed in {elapsed:.2f}s ({duration_sec:.1f}s audio)")
         
-        return chunks_sent > 0
+        return pcm_data
         
-    except ImportError:
-        logger.error("pydub not installed, TTS disabled")
-        return False
     except Exception as e:
         logger.error(f"TTS error: {e}")
+        return b""
+
+
+async def synthesize_speech(text: str, websocket) -> bool:
+    """
+    Synthesize text to speech and stream to client.
+    Returns True if audio was sent successfully.
+    """
+    if not tts_enabled:
+        return False
+    
+    try:
+        # Run synthesis in thread to avoid blocking
+        pcm_data = await asyncio.to_thread(synthesize_speech_sync, text)
+        
+        if not pcm_data:
+            return False
+        
+        # Send audio in chunks to prevent timeout on large responses
+        chunk_size = 48000  # ~1 second of audio at 24kHz, 16-bit
+        chunks_sent = 0
+        
+        for i in range(0, len(pcm_data), chunk_size):
+            chunk = pcm_data[i:i + chunk_size]
+            await websocket.send_bytes(chunk)
+            chunks_sent += 1
+        
+        logger.info(f"🔊 Sent {chunks_sent} audio chunks to client")
+        return True
+        
+    except Exception as e:
+        logger.error(f"TTS streaming error: {e}")
         return False
 
 
@@ -286,10 +376,15 @@ def check_end_session(transcript: str) -> bool:
     return False
 
 
-def generate_response_sync(user_message: str, conversation_history: list) -> str:
+def generate_response_sync(user_message: str, conversation_history: list, emotion: str | None = None) -> str:
     """
     Generate LLM response (synchronous).
     Called via asyncio.to_thread() to avoid blocking.
+    
+    Args:
+        user_message: The transcribed text from the user
+        conversation_history: Previous conversation turns
+        emotion: Optional detected emotion from SenseVoice
     """
     if llm_model is None or llm_tokenizer is None:
         return "I apologize, but my language model isn't loaded. I can hear you, but I can't formulate a proper response."
@@ -305,8 +400,15 @@ def generate_response_sync(user_message: str, conversation_history: list) -> str
         # Add conversation history
         messages.extend(conversation_history)
         
+        # Build user message with emotion context if available
+        emotion_context = ""
+        if emotion and emotion in EMOTION_MAP and EMOTION_MAP[emotion]:
+            emotion_context = f"[The user sounds {EMOTION_MAP[emotion]}] "
+        
+        full_user_message = emotion_context + user_message
+        
         # Add current user message
-        messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": full_user_message})
         
         # Apply chat template
         prompt = llm_tokenizer.apply_chat_template(
@@ -344,9 +446,9 @@ def generate_response_sync(user_message: str, conversation_history: list) -> str
         return "I seem to have hit some turbulence. Could you repeat that?"
 
 
-async def generate_response(user_message: str, conversation_history: list) -> str:
+async def generate_response(user_message: str, conversation_history: list, emotion: str | None = None) -> str:
     """Async wrapper for LLM response generation."""
-    return await asyncio.to_thread(generate_response_sync, user_message, conversation_history)
+    return await asyncio.to_thread(generate_response_sync, user_message, conversation_history, emotion)
 
 
 # This is the endpoint your client.py is trying to hit
@@ -438,12 +540,12 @@ async def audio_endpoint(websocket: WebSocket):
                             complete_audio = b"".join(audio_buffer)
                             logger.info(f"🔊 Speech ended: {duration_ms:.0f}ms, {len(complete_audio)} bytes")
                             
-                            # Transcribe with Whisper
+                            # Transcribe with SenseVoice
                             session_state = SessionState.PROCESSING
-                            transcript = await transcribe_audio(complete_audio)
+                            transcript, emotion = await transcribe_audio(complete_audio)
                             logger.info(f"📝 Transcript: {transcript}")
                             
-                            # Send transcript to client immediately
+                            # Send CLEAN transcript to client (no emotion tags)
                             await websocket.send_text(f"TRANSCRIPT:{transcript}")
                             
                             # Check for end session command
@@ -453,12 +555,12 @@ async def audio_endpoint(websocket: WebSocket):
                                 session_state = SessionState.IDLE
                                 conversation_history = []  # Clear history on session end
                             else:
-                                # Generate LLM response
+                                # Generate LLM response (with emotion context for Gemma)
                                 session_state = SessionState.GENERATING
-                                llm_response = await generate_response(transcript, conversation_history)
+                                llm_response = await generate_response(transcript, conversation_history, emotion)
                                 logger.info(f"🤖 Response: {llm_response}")
                                 
-                                # Update conversation history
+                                # Update conversation history (store clean text only)
                                 conversation_history.append({"role": "user", "content": transcript})
                                 conversation_history.append({"role": "assistant", "content": llm_response})
                                 
@@ -497,5 +599,11 @@ async def audio_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    # 0.0.0.0 is crucial so it listens on the Tailscale/SSH interface, not just local loopback
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    # Configure logging before uvicorn
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
